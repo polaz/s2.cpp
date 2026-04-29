@@ -1,6 +1,7 @@
 #include "../include/s2_pipeline.h"
 #include <cstdio>
 #include <cmath>
+#include <chrono>
 
 namespace s2 {
 
@@ -168,11 +169,19 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
     int32_t T_prompt = 0;
 
     if (!ref_audio.samples.empty()) {
-        if (!codec_.encode(ref_audio.samples.data(), (int32_t)ref_audio.samples.size(),
-                           params.gen.n_threads, ref_codes, T_prompt)) {
+        auto t_enc = std::chrono::high_resolution_clock::now();
+        bool enc_ok = codec_.encode(ref_audio.samples.data(), (int32_t)ref_audio.samples.size(),
+                                    params.gen.n_threads, ref_codes, T_prompt);
+        double ms_enc = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t_enc).count();
+        if (!enc_ok) {
             safe_print_error_ln("Pipeline warning: encode failed, running without reference audio.");
             ref_codes.clear();
             T_prompt = 0;
+        } else {
+            std::fprintf(stderr, "[Timing] Codec encode: %.1f ms (%d ref frames, ref audio %.2f s)\n",
+                         ms_enc, T_prompt,
+                         (float)ref_audio.samples.size() / (float)codec_.sample_rate());
         }
     }
 
@@ -201,10 +210,16 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
         return false;
     }
 
+    auto t_dec = std::chrono::high_resolution_clock::now();
     if (!codec_.decode(res.codes.data(), res.n_frames, params.gen.n_threads, audio_out, audio_out_length)) {
         safe_print_error_ln("Pipeline error: decode failed.");
         return false;
     }
+    double ms_dec = std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - t_dec).count();
+    double audio_dur_s = (double)audio_out.size() / (double)codec_.sample_rate();
+    std::fprintf(stderr, "[Timing] Codec decode: %.1f ms (%d frames → %.2f s audio, RTF %.2fx)\n",
+                 ms_dec, res.n_frames, audio_dur_s, ms_dec / 1000.0 / audio_dur_s);
 
     return true;
 }
