@@ -871,6 +871,15 @@ bool SlowARModel::prefill(const std::vector<int32_t> & flat_tokens, int32_t n_to
     bool ok = eval_cached(flat_tokens, n_tokens, n_threads, result);
     std::swap(allocr_, prefill_allocr);
     ggml_gallocr_free(prefill_allocr);
+
+    // Sync kq_mask_buf_ with the n_past_ that eval_cached just set.
+    // Positions 0..n_past_-1 are now valid KV slots; decode graph must see them as 0.
+    if (ok && decode_.kq_mask && !kq_mask_buf_.empty() && n_past_ > 0) {
+        for (int32_t i = 0; i < n_past_; ++i) kq_mask_buf_[i] = 0.0f;
+        ggml_backend_tensor_set(decode_.kq_mask, kq_mask_buf_.data(), 0,
+                                (size_t)n_past_ * sizeof(float));
+    }
+
     return ok;
 }
 
