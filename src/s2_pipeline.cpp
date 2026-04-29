@@ -43,6 +43,16 @@ bool Pipeline::init(const PipelineParams & params) {
         if (hp.num_codebooks     > 0) tc.num_codebooks     = hp.num_codebooks;
         if (hp.codebook_size     > 0) tc.codebook_size     = hp.codebook_size;
         if (hp.vocab_size        > 0) tc.vocab_size        = hp.vocab_size;
+
+        // Reduce logits PCIe readback to the semantic range + im_end token only.
+        // Positions outside this range have sem_mask=-inf so they're irrelevant.
+        const int32_t im_end   = tc.im_end_id;
+        const int32_t sem_beg  = hp.semantic_begin_id;
+        const int32_t sem_end  = hp.semantic_end_id;
+        if (sem_beg > 0 && sem_end > sem_beg) {
+            const int32_t range_begin = (im_end >= 0 && im_end < sem_beg) ? im_end : sem_beg;
+            model_.set_logits_range(range_begin, sem_end + 1);
+        }
     }
 
     initialized_ = true;

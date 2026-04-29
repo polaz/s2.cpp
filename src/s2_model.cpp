@@ -127,6 +127,8 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t gpu_device, int32_
         std::cerr << "[Model] Failed to init CPU backend." << std::endl;
         return false;
     }
+    // Keep CPU pool at 1 thread — GPU is primary; spinning workers waste cores.
+    ggml_backend_cpu_set_n_threads(backend_cpu_, 1);
 
     if (gpu_device >= 0) {
 #ifdef GGML_USE_VULKAN
@@ -495,17 +497,17 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
     const int32_t dim = hparams_.embedding_length;
     if (dim == 0) return true;
 
-    int32_t head_dim = 0;
     if (hparams_.attention_qk_norm && !weights_.layers.empty() && weights_.layers[0].q_norm) {
-        head_dim = static_cast<int32_t>(weights_.layers[0].q_norm->ne[0]);
+        head_dim_ = static_cast<int32_t>(weights_.layers[0].q_norm->ne[0]);
     } else {
-        head_dim = hparams_.embedding_length / hparams_.head_count;
+        head_dim_ = hparams_.embedding_length / hparams_.head_count;
     }
 
     const int32_t n_head_kv = hparams_.head_count_kv;
     const int32_t n_layer   = hparams_.block_count;
 
-    const size_t ctx_kv_size = 2ull * ggml_tensor_overhead() + (1ull << 20);
+    // ctx_kv_ holds: memory_k_, memory_v_, + 2*n_layer staging tensors.
+    const size_t ctx_kv_size = (2ull + 2ull * (size_t)n_layer) * ggml_tensor_overhead() + (1ull << 20);
     ggml_init_params p = {
         /*.mem_size =*/ ctx_kv_size,
         /*.mem_buffer =*/ nullptr,
@@ -517,8 +519,16 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
         return false;
     }
 
-    memory_k_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len, n_layer);
-    memory_v_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len, n_layer);
+    memory_k_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim_, n_head_kv, max_seq_len, n_layer);
+    memory_v_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim_, n_head_kv, max_seq_len, n_layer);
+
+    // One-slot staging buffers per layer for the persistent decode graph.
+    k_cur_stage_.resize(n_layer);
+    v_cur_stage_.resize(n_layer);
+    for (int32_t il = 0; il < n_layer; ++il) {
+        k_cur_stage_[il] = ggml_new_tensor_3d(ctx_kv_, GGML_TYPE_F16, head_dim_, n_head_kv, 1);
+        v_cur_stage_[il] = ggml_new_tensor_3d(ctx_kv_, GGML_TYPE_F16, head_dim_, n_head_kv, 1);
+    }
 
     kv_buf_ = ggml_backend_alloc_ctx_tensors(ctx_kv_, backend_);
     if (!kv_buf_) {
@@ -576,6 +586,8 @@ void SlowARModel::clear_kv_cache() {
 
     memory_k_ = nullptr;
     memory_v_ = nullptr;
+    k_cur_stage_.clear();
+    v_cur_stage_.clear();
 
     max_seq_len_ = 0;
     n_past_ = 0;
@@ -584,15 +596,171 @@ void SlowARModel::clear_kv_cache() {
 // ---------------------------------------------------------------------------
 // build_decode_graph() — called once per init_kv_cache
 //
-// No persistent graph: prefill() and step() both use eval_cached() which
-// rebuilds the graph per call and shares allocr_.  After the prefill call
-// allocr_ holds a GPU buffer sized for the full prompt; all subsequent
-// single-token step calls reuse that buffer (no realloc) since their graphs
-// are strictly smaller.  This matches baseline performance and avoids the
-// CUDA graph invalidation caused by per-step view pointer updates.
+// Builds a persistent single-token decode graph with FIXED tensor shapes so
+// that GGML can capture and replay a CUDA graph.  Key design choices:
+//
+//  • kq_mask is (max_seq_len_+1, 1) — never changes shape; content updated
+//    per step to mask out unwritten KV slots.
+//  • k/v past views span ALL max_seq_len_ slots; invalid future slots are
+//    masked to -inf in kq_mask.
+//  • Current K/V written to fixed staging buffers (k_cur_stage_[il]) via
+//    ggml_cpy inside the graph; post-graph async D2D copies to KV slot.
+//  • No gallocr re-plan per step — graph allocated once, reused forever.
 // ---------------------------------------------------------------------------
 
 bool SlowARModel::build_decode_graph() {
+    const int32_t dim       = hparams_.embedding_length;
+    const int32_t n_head    = hparams_.head_count;
+    const int32_t n_head_kv = hparams_.head_count_kv;
+    const int32_t q_size    = n_head * head_dim_;
+    const int32_t kv_size   = n_head_kv * head_dim_;
+    const float attn_scale  = 1.0f / std::sqrt(static_cast<float>(head_dim_));
+    const float sem_scale   = 1.0f / std::sqrt(static_cast<float>(hparams_.num_codebooks + 1));
+    (void)kv_size;
+    (void)sem_scale;
+
+    const size_t ctx_sz = 12ull * 1024ull * 1024ull;
+    ggml_init_params p = { ctx_sz, nullptr, /*no_alloc=*/true };
+    decode_.ctx = ggml_init(p);
+    if (!decode_.ctx) return false;
+
+    ggml_cgraph * gf = ggml_new_graph_custom(decode_.ctx, 32768, false);
+
+    // Fixed-shape input tensors (content set per step via tensor_set)
+    decode_.semantic_ids  = ggml_new_tensor_1d(decode_.ctx, GGML_TYPE_I32, 1);
+    decode_.positions     = ggml_new_tensor_1d(decode_.ctx, GGML_TYPE_I32, 1);
+    decode_.semantic_mask = ggml_new_tensor_2d(decode_.ctx, GGML_TYPE_F32, 1, 1);
+    if (hparams_.scale_codebook_embeddings) {
+        decode_.token_scale = ggml_new_tensor_2d(decode_.ctx, GGML_TYPE_F32, 1, 1);
+    }
+
+    decode_.cb_id_tensors.resize(hparams_.num_codebooks);
+    for (int32_t cb = 0; cb < hparams_.num_codebooks; ++cb) {
+        decode_.cb_id_tensors[cb] = ggml_new_tensor_1d(decode_.ctx, GGML_TYPE_I32, 1);
+    }
+
+    // kq_mask: (max_seq_len_+1, 1) — FIXED shape, content updated per step.
+    decode_.kq_mask = ggml_new_tensor_2d(decode_.ctx, GGML_TYPE_F32, (int64_t)max_seq_len_ + 1, 1);
+
+    // Embedding lookup
+    ggml_tensor * emb_get = emb_f16_.embeddings ? emb_f16_.embeddings : weights_.embeddings;
+    ggml_tensor * x = ggml_get_rows(decode_.ctx, emb_get, decode_.semantic_ids);
+    if (x->type != GGML_TYPE_F32) x = ggml_cast(decode_.ctx, x, GGML_TYPE_F32);
+
+    ggml_tensor * cb_emb = emb_f16_.codebook_embeddings
+                         ? emb_f16_.codebook_embeddings
+                         : weights_.codebook_embeddings;
+    ggml_tensor * codebook_sum = nullptr;
+    for (int32_t cb = 0; cb < hparams_.num_codebooks; ++cb) {
+        ggml_tensor * emb = ggml_get_rows(decode_.ctx, cb_emb, decode_.cb_id_tensors[cb]);
+        if (emb->type != GGML_TYPE_F32) emb = ggml_cast(decode_.ctx, emb, GGML_TYPE_F32);
+        codebook_sum = (codebook_sum == nullptr) ? emb : ggml_add(decode_.ctx, codebook_sum, emb);
+    }
+    if (codebook_sum != nullptr) {
+        codebook_sum = ggml_mul(decode_.ctx, codebook_sum,
+                                ggml_repeat(decode_.ctx, decode_.semantic_mask, codebook_sum));
+        x = ggml_add(decode_.ctx, x, codebook_sum);
+    }
+    if (decode_.token_scale != nullptr) {
+        x = ggml_mul(decode_.ctx, x, ggml_repeat(decode_.ctx, decode_.token_scale, x));
+    }
+
+    decode_.k_write_views.resize(hparams_.block_count);
+    decode_.v_write_views.resize(hparams_.block_count);
+
+    for (int32_t il = 0; il < hparams_.block_count; ++il) {
+        const auto & layer = weights_.layers[il];
+
+        ggml_tensor * attn_in = rms_norm_weighted(decode_.ctx, x, layer.attention_norm, hparams_.rms_norm_eps);
+        ggml_tensor * qkv     = mul_mat_checked(decode_.ctx, layer.wqkv, attn_in, "mul_mat:wqkv");
+        const size_t elem_size = ggml_element_size(qkv);
+
+        ggml_tensor * q2d = ggml_view_2d(decode_.ctx, qkv, q_size,  1, qkv->nb[1], 0);
+        ggml_tensor * k2d = ggml_view_2d(decode_.ctx, qkv, n_head_kv * head_dim_, 1, qkv->nb[1], (size_t)q_size * elem_size);
+        ggml_tensor * v2d = ggml_view_2d(decode_.ctx, qkv, n_head_kv * head_dim_, 1, qkv->nb[1], (size_t)(q_size + n_head_kv * head_dim_) * elem_size);
+
+        ggml_tensor * q = ggml_reshape_3d(decode_.ctx, ggml_cont(decode_.ctx, q2d), head_dim_, n_head,    1);
+        ggml_tensor * k = ggml_reshape_3d(decode_.ctx, ggml_cont(decode_.ctx, k2d), head_dim_, n_head_kv, 1);
+        ggml_tensor * v = ggml_reshape_3d(decode_.ctx, ggml_cont(decode_.ctx, v2d), head_dim_, n_head_kv, 1);
+
+        if (hparams_.attention_qk_norm) {
+            q = rms_norm_weighted(decode_.ctx, q, layer.q_norm, hparams_.rms_norm_eps);
+            k = rms_norm_weighted(decode_.ctx, k, layer.k_norm, hparams_.rms_norm_eps);
+        }
+
+        q = ggml_rope_ext(decode_.ctx, q, decode_.positions, nullptr, head_dim_, 0,
+                          hparams_.context_length, hparams_.rope_freq_base,
+                          1.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        k = ggml_rope_ext(decode_.ctx, k, decode_.positions, nullptr, head_dim_, 0,
+                          hparams_.context_length, hparams_.rope_freq_base,
+                          1.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+
+        // Write current K/V to fixed staging buffers (FIXED destination pointer).
+        // ggml_cpy returns a view of k_cur_stage_[il] — used as concat input to
+        // ensure the copy executes before the concat reads from staging.
+        ggml_tensor * k_cpy = ggml_cpy(decode_.ctx, k, k_cur_stage_[il]);
+        ggml_tensor * v_cpy = ggml_cpy(decode_.ctx, v, v_cur_stage_[il]);
+        decode_.k_write_views[il] = k_cpy;
+        decode_.v_write_views[il] = v_cpy;
+
+        // Past K/V: read ALL max_seq_len_ slots (FIXED shape).
+        // Unwritten slots are masked to -inf via kq_mask.
+        const size_t layer_off_k = static_cast<size_t>(il) * memory_k_->nb[3];
+        const size_t layer_off_v = static_cast<size_t>(il) * memory_v_->nb[3];
+        ggml_tensor * k_past = ggml_view_3d(decode_.ctx, memory_k_,
+            head_dim_, n_head_kv, max_seq_len_,
+            memory_k_->nb[1], memory_k_->nb[2], layer_off_k);
+        ggml_tensor * v_past = ggml_view_3d(decode_.ctx, memory_v_,
+            head_dim_, n_head_kv, max_seq_len_,
+            memory_v_->nb[1], memory_v_->nb[2], layer_off_v);
+
+        // Concat past (max_seq_len_) with current (1) → max_seq_len_+1 total.
+        // k_cpy is a view of k_cur_stage_, guaranteeing cpy executes before concat.
+        ggml_tensor * k_all = ggml_concat(decode_.ctx, k_past, k_cpy, 2);
+        ggml_tensor * v_all = ggml_concat(decode_.ctx, v_past, v_cpy, 2);
+
+        ggml_tensor * k_rep = repeat_interleave_heads(decode_.ctx, k_all, n_head / n_head_kv);
+        ggml_tensor * v_rep = repeat_interleave_heads(decode_.ctx, v_all, n_head / n_head_kv);
+
+        ggml_tensor * Q   = ggml_permute(decode_.ctx, q,     0, 2, 1, 3);
+        ggml_tensor * K   = ggml_permute(decode_.ctx, k_rep, 0, 2, 1, 3);
+        ggml_tensor * KQ  = mul_mat_checked(decode_.ctx, K, Q, "mul_mat:kq");
+        ggml_tensor * KQf = ggml_soft_max_ext(decode_.ctx, KQ, decode_.kq_mask, attn_scale, 0.0f);
+
+        ggml_tensor * V       = ggml_cont(decode_.ctx, ggml_permute(decode_.ctx, v_rep, 1, 2, 0, 3));
+        ggml_tensor * KQV     = mul_mat_checked(decode_.ctx, V, KQf, "mul_mat:kqv");
+        ggml_tensor * KQVm    = ggml_permute(decode_.ctx, KQV, 0, 2, 1, 3);
+        ggml_tensor * attn_cur = ggml_cpy(decode_.ctx, KQVm,
+                                          ggml_new_tensor_2d(decode_.ctx, GGML_TYPE_F32, q_size, 1));
+        ggml_tensor * attn_out = mul_mat_checked(decode_.ctx, layer.wo, attn_cur, "mul_mat:wo");
+
+        ggml_tensor * h     = ggml_add(decode_.ctx, x, attn_out);
+        ggml_tensor * ff_in = rms_norm_weighted(decode_.ctx, h, layer.ffn_norm, hparams_.rms_norm_eps);
+        ggml_tensor * gate  = mul_mat_checked(decode_.ctx, layer.w1, ff_in, "mul_mat:w1");
+        ggml_tensor * up    = mul_mat_checked(decode_.ctx, layer.w3, ff_in, "mul_mat:w3");
+        ggml_tensor * ff_h  = ggml_swiglu_split(decode_.ctx, gate, up);
+        ggml_tensor * ff_out = mul_mat_checked(decode_.ctx, layer.w2, ff_h, "mul_mat:w2");
+
+        x = ggml_add(decode_.ctx, h, ff_out);
+    }
+
+    ggml_tensor * slow_out  = rms_norm_weighted(decode_.ctx, x, weights_.norm, hparams_.rms_norm_eps);
+    ggml_tensor * slow_cont = ggml_cont(decode_.ctx, slow_out);
+    decode_.hidden_last = ggml_cpy(decode_.ctx,
+        last_token_view(decode_.ctx, slow_cont, 1),
+        ggml_new_tensor_2d(decode_.ctx, GGML_TYPE_F32, dim, 1));
+    decode_.logits = mul_mat_checked(decode_.ctx, weights_.embeddings, decode_.hidden_last, "mul_mat:logits");
+    ggml_build_forward_expand(gf, decode_.logits);
+    decode_.graph = gf;
+
+    if (!ggml_gallocr_alloc_graph(allocr_, gf)) {
+        std::fprintf(stderr, "[build_decode_graph] gallocr alloc failed\n");
+        ggml_free(decode_.ctx);
+        decode_.ctx  = nullptr;
+        decode_.graph = nullptr;
+        return false;
+    }
+
     return true;
 }
 
@@ -616,7 +784,131 @@ bool SlowARModel::prefill(const std::vector<int32_t> & flat_tokens, int32_t n_to
 
 bool SlowARModel::step(const std::vector<int32_t> & flat_tokens, int32_t n_threads,
                        StepResult & result) {
-    return eval_cached(flat_tokens, 1, n_threads, result);
+    // Fall back to eval_cached if persistent graph wasn't built.
+    if (!decode_.ctx || !decode_.graph) {
+        return eval_cached(flat_tokens, 1, n_threads, result);
+    }
+
+    const int32_t codebook_dim = hparams_.num_codebooks + 1;
+    if (static_cast<int32_t>(flat_tokens.size()) != codebook_dim) {
+        std::fprintf(stderr, "[step] expected %d ints, got %zu\n", codebook_dim, flat_tokens.size());
+        return false;
+    }
+    if (n_past_ >= max_seq_len_) {
+        std::fprintf(stderr, "[step] KV cache full (%d >= %d)\n", n_past_, max_seq_len_);
+        return false;
+    }
+
+    const int32_t semantic = flat_tokens[0];
+    const bool is_semantic = (semantic >= hparams_.semantic_begin_id &&
+                               semantic <= hparams_.semantic_end_id);
+    const float sem_scale  = 1.0f / std::sqrt(static_cast<float>(codebook_dim));
+
+    // Fill kq_mask: [0..n_past_-1]=0 (valid past), [n_past_..max_seq_len_-1]=-inf,
+    // [max_seq_len_]=0 (current token appended last via concat).
+    const int32_t mask_len = max_seq_len_ + 1;
+    std::vector<float> kq_data(mask_len, -std::numeric_limits<float>::infinity());
+    for (int32_t i = 0; i < n_past_; ++i) kq_data[i] = 0.0f;
+    kq_data[max_seq_len_] = 0.0f;
+    ggml_backend_tensor_set(decode_.kq_mask, kq_data.data(), 0, (size_t)mask_len * sizeof(float));
+
+    // Input ids and position
+    int32_t pos = n_past_;
+    ggml_backend_tensor_set(decode_.semantic_ids,  &semantic, 0, sizeof(int32_t));
+    ggml_backend_tensor_set(decode_.positions,     &pos,      0, sizeof(int32_t));
+    float sem_f = is_semantic ? 1.0f : 0.0f;
+    ggml_backend_tensor_set(decode_.semantic_mask, &sem_f,    0, sizeof(float));
+    if (decode_.token_scale) {
+        float ts = is_semantic ? sem_scale : 1.0f;
+        ggml_backend_tensor_set(decode_.token_scale, &ts, 0, sizeof(float));
+    }
+    for (int32_t cb = 0; cb < hparams_.num_codebooks; ++cb) {
+        int32_t cb_id = 0;
+        if (is_semantic) {
+            cb_id = flat_tokens[cb + 1] + cb * hparams_.codebook_size;
+        }
+        ggml_backend_tensor_set(decode_.cb_id_tensors[cb], &cb_id, 0, sizeof(int32_t));
+    }
+
+    if (ggml_backend_is_cpu(backend_)) {
+        ggml_backend_cpu_set_n_threads(backend_, n_threads);
+    }
+    if (ggml_backend_graph_compute(backend_, decode_.graph) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "[step] compute failed\n");
+        return false;
+    }
+
+    // Post-graph: async D2D copy staging → correct KV slot for this step.
+    // Copies are issued on the compute stream (no per-copy sync); the next
+    // graph_compute on the same stream will see the updated KV cache.
+    if (backend_gpu_) {
+        const size_t kv_copy_ctx_size = 2ull * (size_t)hparams_.block_count * ggml_tensor_overhead() + 4096;
+        ggml_init_params pc = { kv_copy_ctx_size, nullptr, /*no_alloc=*/true };
+        ggml_context * ctx_copy = ggml_init(pc);
+        if (ctx_copy) {
+            for (int32_t il = 0; il < hparams_.block_count; ++il) {
+                const size_t layer_off_k = (size_t)il * memory_k_->nb[3];
+                const size_t slot_off_k  = (size_t)n_past_ * memory_k_->nb[2];
+                ggml_tensor * k_dst = ggml_view_3d(ctx_copy, memory_k_,
+                    head_dim_, hparams_.head_count_kv, 1,
+                    memory_k_->nb[1], memory_k_->nb[2], layer_off_k + slot_off_k);
+                k_dst->buffer = memory_k_->buffer;
+                ggml_backend_tensor_copy_async(backend_gpu_, backend_gpu_, k_cur_stage_[il], k_dst);
+
+                const size_t layer_off_v = (size_t)il * memory_v_->nb[3];
+                const size_t slot_off_v  = (size_t)n_past_ * memory_v_->nb[2];
+                ggml_tensor * v_dst = ggml_view_3d(ctx_copy, memory_v_,
+                    head_dim_, hparams_.head_count_kv, 1,
+                    memory_v_->nb[1], memory_v_->nb[2], layer_off_v + slot_off_v);
+                v_dst->buffer = memory_v_->buffer;
+                ggml_backend_tensor_copy_async(backend_gpu_, backend_gpu_, v_cur_stage_[il], v_dst);
+            }
+            ggml_free(ctx_copy);
+        }
+    } else {
+        // CPU: blocking copy (tiny tensors, negligible cost)
+        const size_t kv_copy_ctx_size = 2ull * (size_t)hparams_.block_count * ggml_tensor_overhead() + 4096;
+        ggml_init_params pc = { kv_copy_ctx_size, nullptr, /*no_alloc=*/true };
+        ggml_context * ctx_copy = ggml_init(pc);
+        if (ctx_copy) {
+            for (int32_t il = 0; il < hparams_.block_count; ++il) {
+                const size_t layer_off_k = (size_t)il * memory_k_->nb[3];
+                const size_t slot_off_k  = (size_t)n_past_ * memory_k_->nb[2];
+                ggml_tensor * k_dst = ggml_view_3d(ctx_copy, memory_k_,
+                    head_dim_, hparams_.head_count_kv, 1,
+                    memory_k_->nb[1], memory_k_->nb[2], layer_off_k + slot_off_k);
+                ggml_backend_tensor_copy(k_cur_stage_[il], k_dst);
+
+                const size_t layer_off_v = (size_t)il * memory_v_->nb[3];
+                const size_t slot_off_v  = (size_t)n_past_ * memory_v_->nb[2];
+                ggml_tensor * v_dst = ggml_view_3d(ctx_copy, memory_v_,
+                    head_dim_, hparams_.head_count_kv, 1,
+                    memory_v_->nb[1], memory_v_->nb[2], layer_off_v + slot_off_v);
+                ggml_backend_tensor_copy(v_cur_stage_[il], v_dst);
+            }
+            ggml_free(ctx_copy);
+        }
+    }
+
+    // Read hidden state and (partial) logits from GPU.
+    result.hidden.resize(hparams_.embedding_length);
+    ggml_backend_tensor_get(decode_.hidden_last, result.hidden.data(), 0,
+                            (size_t)hparams_.embedding_length * sizeof(float));
+
+    result.logits.assign(hparams_.vocab_size, -std::numeric_limits<float>::infinity());
+    if (logits_range_end_ > logits_range_begin_) {
+        const int32_t n_read = logits_range_end_ - logits_range_begin_;
+        ggml_backend_tensor_get(decode_.logits,
+                                result.logits.data() + logits_range_begin_,
+                                (size_t)logits_range_begin_ * sizeof(float),
+                                (size_t)n_read * sizeof(float));
+    } else {
+        ggml_backend_tensor_get(decode_.logits, result.logits.data(), 0,
+                                (size_t)hparams_.vocab_size * sizeof(float));
+    }
+
+    n_past_++;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -862,9 +1154,19 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     }
 
     result.hidden.resize(dim);
-    result.logits.resize(hparams_.vocab_size);
-    ggml_backend_tensor_get(hidden_last, result.hidden.data(), 0, dim * sizeof(float));
-    ggml_backend_tensor_get(logits,      result.logits.data(), 0, hparams_.vocab_size * sizeof(float));
+    ggml_backend_tensor_get(hidden_last, result.hidden.data(), 0, (size_t)dim * sizeof(float));
+
+    result.logits.assign(hparams_.vocab_size, -std::numeric_limits<float>::infinity());
+    if (logits_range_end_ > logits_range_begin_) {
+        const int32_t n_read = logits_range_end_ - logits_range_begin_;
+        ggml_backend_tensor_get(logits,
+                                result.logits.data() + logits_range_begin_,
+                                (size_t)logits_range_begin_ * sizeof(float),
+                                (size_t)n_read * sizeof(float));
+    } else {
+        ggml_backend_tensor_get(logits, result.logits.data(), 0,
+                                (size_t)hparams_.vocab_size * sizeof(float));
+    }
 
     ggml_free(ctx0);
     n_past_ += n_tokens;

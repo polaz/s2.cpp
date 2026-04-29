@@ -124,6 +124,13 @@ public:
 
     const ModelHParams & hparams() const { return hparams_; }
 
+    // Restrict logits readback to [begin, end) — positions outside are returned as -inf.
+    // Call before generation to reduce PCIe transfer from vocab_size to semantic range only.
+    void set_logits_range(int32_t begin, int32_t end) {
+        logits_range_begin_ = begin;
+        logits_range_end_   = end;
+    }
+
 private:
     ModelHParams   hparams_;
     ModelWeights   weights_;
@@ -138,6 +145,14 @@ private:
     int32_t        max_seq_len_ = 0;
     int32_t        n_past_     = 0;
     int32_t        n_gpu_layers_ = 0;
+    int32_t        head_dim_   = 0;
+    int32_t        logits_range_begin_ = 0;
+    int32_t        logits_range_end_   = 0;
+
+    // Per-layer staging buffers for current-step K/V (live in kv_buf_).
+    // Graph writes here (fixed destination); post-graph async D2D copy → correct KV slot.
+    std::vector<ggml_tensor *> k_cur_stage_;
+    std::vector<ggml_tensor *> v_cur_stage_;
 
     // F16 copies of embedding tensors for CUDA get_rows compatibility
     struct {
