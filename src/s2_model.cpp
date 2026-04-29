@@ -602,13 +602,20 @@ bool SlowARModel::build_decode_graph() {
 
 bool SlowARModel::prefill(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
                           int32_t n_threads, StepResult & result) {
-    return eval_cached(flat_tokens, n_tokens, n_threads, result);
+    // Use a temporary gallocr for prefill so the large compute buffer
+    // (sized for n_tokens) is freed immediately after, leaving allocr_
+    // fresh for decode steps that start small (n_kv=1) and grow gradually.
+    ggml_gallocr_t prefill_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+    if (!prefill_allocr) return false;
+    std::swap(allocr_, prefill_allocr);
+    bool ok = eval_cached(flat_tokens, n_tokens, n_threads, result);
+    std::swap(allocr_, prefill_allocr);
+    ggml_gallocr_free(prefill_allocr);
+    return ok;
 }
 
 bool SlowARModel::step(const std::vector<int32_t> & flat_tokens, int32_t n_threads,
                        StepResult & result) {
-    // eval_cached handles n_tokens=1 with the same shared allocr_ that was
-    // pre-heated during prefill, so no GPU buffer realloc occurs per step.
     return eval_cached(flat_tokens, 1, n_threads, result);
 }
 
