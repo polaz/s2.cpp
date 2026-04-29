@@ -818,10 +818,15 @@ bool SlowARModel::build_decode_graph() {
 
 // ---------------------------------------------------------------------------
 // warmup_decode_graph()
-// Run 2 consecutive step() calls so GGML's CUDA graph mechanism captures
-// decode_.graph.  The snapshot saved before call-1 must match the state at
-// call-2 (no struct changes between calls) → warmup_complete=true → capture.
-// After warmup, n_past_ is reset to 0 and kq_mask is restored.
+// Run up to WARMUP_MAX_CALLS consecutive step() calls until GGML's CUDA graph
+// mechanism captures decode_.graph.
+//
+// GGML snapshots full ggml_tensor structs before each execution.  The first
+// call may lazily initialise CUDA-specific fields (e.g. extra pointers on
+// intermediate tensors); those changes cause call-2 to see a diff.  Call-3
+// then compares stable-state snapshots → properties_changed=false → CAPTURE.
+// 4 calls guarantees capture even if two lazy-init passes are needed.
+// After warmup n_past_ and kq_mask are reset to their pre-generation state.
 // ---------------------------------------------------------------------------
 
 void SlowARModel::warmup_decode_graph() {
@@ -829,11 +834,15 @@ void SlowARModel::warmup_decode_graph() {
 
     const int32_t codebook_dim = hparams_.num_codebooks + 1;
     std::vector<int32_t> dummy(codebook_dim, 0);
-    dummy[0] = hparams_.semantic_begin_id;  // valid semantic token
+    dummy[0] = hparams_.semantic_begin_id;
 
+    constexpr int WARMUP_MAX_CALLS = 4;
     StepResult dummy_result;
-    step(dummy, 1, dummy_result);  // call 1: snapshot saved, execute directly
-    step(dummy, 1, dummy_result);  // call 2: snapshot matches → CUDA graph captured
+    std::cerr << "[Model] Warming up decode graph (" << WARMUP_MAX_CALLS << " calls)..." << std::endl;
+    for (int i = 0; i < WARMUP_MAX_CALLS; ++i) {
+        if (!step(dummy, 1, dummy_result)) break;
+    }
+    std::cerr << "[Model] Decode graph warmup done (CUDA graph capture logged above if successful)." << std::endl;
 
     // Reset to pre-generation state.
     n_past_ = 0;

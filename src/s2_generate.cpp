@@ -4,6 +4,14 @@
 #include <limits>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+
+namespace {
+    using hrc = std::chrono::high_resolution_clock;
+    double elapsed_ms(hrc::time_point t0) {
+        return std::chrono::duration<double, std::milli>(hrc::now() - t0).count();
+    }
+} // namespace
 
 namespace s2 {
 
@@ -50,9 +58,15 @@ GenerateResult generate(
     if (params.verbose) {
         if(!SuppressNonEssentialVerbosity) { std::cout << "[Generate] Prefilling " << prompt.cols << " tokens..." << std::endl; }
     }
+    auto t_prefill = hrc::now();
     if (!model.prefill(prompt_tm, prompt.cols, params.n_threads, state)) {
         std::cerr << "[Generate] Prefill failed." << std::endl;
         return out;
+    }
+    double ms_prefill = elapsed_ms(t_prefill);
+    if(!SuppressNonEssentialVerbosity) {
+        std::fprintf(stderr, "[Timing] Prefill: %.1f ms (%d tokens, %.2f ms/tok)\n",
+                     ms_prefill, prompt.cols, ms_prefill / std::max(prompt.cols, 1));
     }
 
     // Apply semantic mask to initial logits
@@ -97,6 +111,9 @@ GenerateResult generate(
         if(!SuppressNonEssentialVerbosity) { std::cout << "[Generate] Generating (max " << params.max_new_tokens << " tokens)..." << std::endl; }
     }
 
+    double ms_fast_total = 0.0;
+    double ms_step_total = 0.0;
+
     int32_t step = 0;
     while (main_token != im_end_id && step < params.max_new_tokens) {
         // RAS check
@@ -137,6 +154,7 @@ GenerateResult generate(
         codebooks_cb.push_back(sem_code);
 
         // Fast AR: generate remaining num_cb-1 codebooks
+        auto t_fast = hrc::now();
         for (int32_t cb_idx = 1; cb_idx < num_cb; ++cb_idx) {
             // prefix = codebooks_cb[0..cb_idx-1]
             if (!model.fast_decode(state.hidden, codebooks_cb, params.n_threads, fast_logits)) {
@@ -150,6 +168,7 @@ GenerateResult generate(
             int32_t cb_token = sample_token(fast_logits.data(), (int32_t)fast_logits.size(), sparams);
             codebooks_cb.push_back(cb_token);
         }
+        ms_fast_total += elapsed_ms(t_fast);
 
         // Store frame: codes[cb * n_frames_capacity + step] = codebooks_cb[cb]
         for (int32_t cb = 0; cb < num_cb; ++cb) {
@@ -164,10 +183,12 @@ GenerateResult generate(
             step_input[cb + 1] = codebooks_cb[cb];
         }
 
+        auto t_step = hrc::now();
         if (!model.step(step_input, params.n_threads, state)) {
             std::cerr << "[Generate] step() failed at step " << step << std::endl;
             break;
         }
+        ms_step_total += elapsed_ms(t_step);
 
         step++;
         if (params.verbose && step % 50 == 0) {
@@ -177,6 +198,13 @@ GenerateResult generate(
         // Apply semantic mask and sample next main token
         bool block_next_end = (step < params.min_tokens_before_end);
         main_token = apply_mask_and_sample(state.logits, block_next_end);
+    }
+
+    if(!SuppressNonEssentialVerbosity && out.n_frames > 0) {
+        std::fprintf(stderr, "[Timing] Generate: %d frames | step=%.0f ms total (%.1f ms/frame) | fast=%.0f ms total (%.1f ms/frame)\n",
+                     out.n_frames,
+                     ms_step_total, ms_step_total / out.n_frames,
+                     ms_fast_total, ms_fast_total / out.n_frames);
     }
 
     if (params.verbose) {
