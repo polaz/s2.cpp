@@ -45,7 +45,8 @@ struct transformer_inputs {
 };
 
 struct AudioCodec::Impl {
-    ggml_backend_t        backend   = nullptr;
+    ggml_backend_t        backend     = nullptr; // primary (GPU if available)
+    ggml_backend_t        backend_cpu = nullptr; // always CPU, for conv_transpose decode
     ggml_context *        ctx_w     = nullptr;
     ggml_backend_buffer_t model_buf = nullptr;
     std::string tprefix;
@@ -658,7 +659,9 @@ AudioCodec::~AudioCodec() {
     if (impl_) {
         if (impl_->ctx_w)     ggml_free(impl_->ctx_w);
         if (impl_->model_buf) ggml_backend_buffer_free(impl_->model_buf);
-        if (impl_->backend)   ggml_backend_free(impl_->backend);
+        if (impl_->backend)     ggml_backend_free(impl_->backend);
+        if (impl_->backend_cpu && impl_->backend_cpu != impl_->backend)
+            ggml_backend_free(impl_->backend_cpu);
         delete impl_;
         impl_ = nullptr;
     }
@@ -689,6 +692,18 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t gpu_device, int32_t
     }
     if (!impl_->backend) impl_->backend = ggml_backend_cpu_init();
     if (!impl_->backend) { std::cerr << "[Codec] No backend." << std::endl; return false; }
+
+    // Always keep a CPU backend for conv_transpose (decode step3): CUDA kernel is
+    // 4x slower than multithreaded CPU for this op (scatter vs BLAS).
+    if (ggml_backend_is_cpu(impl_->backend)) {
+        impl_->backend_cpu = impl_->backend; // primary IS cpu, reuse
+    } else {
+        impl_->backend_cpu = ggml_backend_cpu_init();
+        if (!impl_->backend_cpu) {
+            std::cerr << "[Codec] CPU backend init failed, using primary for decode." << std::endl;
+            impl_->backend_cpu = impl_->backend;
+        }
+    }
 
     struct gguf_init_params params = { true, &impl_->ctx_w };
     gguf_context * gguf_ctx = gguf_init_from_file(gguf_path.c_str(), params);
@@ -1121,8 +1136,11 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, 131072, false);
         ggml_build_forward_expand(gf, audio_t);
 
+        // Step3 decoder uses CPU backend: CUDA conv_transpose_1d is ~4x slower than
+        // multithreaded CPU (naive per-output scatter vs blocked BLAS).
+        ggml_backend_t dec_backend = impl_->backend_cpu;
         auto t_dalloc = std::chrono::high_resolution_clock::now();
-        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(dec_backend));
         if (!allocr || !ggml_gallocr_alloc_graph(allocr, gf)) {
             if (allocr) ggml_gallocr_free(allocr);
             ggml_free(ctx);
@@ -1132,9 +1150,9 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
             std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-t_dalloc).count());
 
         ggml_backend_tensor_set(latent_in, latent_out.data(), 0, latent_out.size() * sizeof(float));
-        if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, n_threads);
+        ggml_backend_cpu_set_n_threads(dec_backend, n_threads);
         auto t_dcomp = std::chrono::high_resolution_clock::now();
-        if (ggml_backend_graph_compute(impl_->backend, gf) != GGML_STATUS_SUCCESS) {
+        if (ggml_backend_graph_compute(dec_backend, gf) != GGML_STATUS_SUCCESS) {
             std::cerr << "[Codec::decode] decoder compute failed." << std::endl;
             ggml_gallocr_free(allocr);
             ggml_free(ctx);

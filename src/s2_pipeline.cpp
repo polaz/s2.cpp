@@ -31,10 +31,9 @@ bool Pipeline::init(const PipelineParams & params) {
         return false;
     }
 
-    // Codec runs on CPU: CUDA conv_transpose_1d kernel is ~4x slower than CPU
-    // (scatter per-output-element vs multithreaded CPU). Step2 transformer is faster
-    // on GPU but step3 decoder dominates decode time (18s GPU vs 4.6s CPU for 21 frames).
-    if (!codec_.load(params.model_path, -1, -1)) {
+    // Codec uses GPU for encode + decode step2 (transformer), CPU for decode step3
+    // (conv_transpose_1d): CUDA kernel is 4x slower than CPU for that op.
+    if (!codec_.load(params.model_path, params.gpu_device, params.backend_type)) {
         safe_print_error_ln("Pipeline error: could not load codec from " + params.model_path);
         return false;
     }
