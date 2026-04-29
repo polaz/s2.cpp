@@ -849,13 +849,10 @@ void SlowARModel::warmup_decode_graph() {
     constexpr int WARMUP_MAX_CALLS = 4;
     StepResult dummy_result;
     std::cerr << "[Model] Warming up decode graph (" << WARMUP_MAX_CALLS << " calls)..." << std::endl;
-    auto t_wu = hrc::now();
     for (int i = 0; i < WARMUP_MAX_CALLS; ++i) {
-        auto t_i = hrc::now();
         if (!step(dummy, 1, dummy_result)) break;
-        std::fprintf(stderr, "[Model] Warmup call %d: %.0f ms\n", i + 1, elapsed_ms(t_i));
     }
-    std::fprintf(stderr, "[Model] Decode graph warmup done: %.0f ms total\n", elapsed_ms(t_wu));
+    std::cerr << "[Model] Decode graph warmup done (CUDA graph capture logged above if successful)." << std::endl;
 
     // Reset to pre-generation state.
     n_past_ = 0;
