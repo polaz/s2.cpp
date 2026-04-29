@@ -520,15 +520,17 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
         return false;
     }
 
-    memory_k_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim_, n_head_kv, max_seq_len, n_layer);
-    memory_v_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim_, n_head_kv, max_seq_len, n_layer);
+    // F32 KV cache: required by ggml_cuda_op_concat (asserts src0->type == F32).
+    // ~288 MB for 36 layers, 8 KV heads, 128 head_dim, 1024 seq_len — negligible on A100.
+    memory_k_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F32, head_dim_, n_head_kv, max_seq_len, n_layer);
+    memory_v_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F32, head_dim_, n_head_kv, max_seq_len, n_layer);
 
     // One-slot staging buffers per layer for the persistent decode graph.
     k_cur_stage_.resize(n_layer);
     v_cur_stage_.resize(n_layer);
     for (int32_t il = 0; il < n_layer; ++il) {
-        k_cur_stage_[il] = ggml_new_tensor_3d(ctx_kv_, GGML_TYPE_F16, head_dim_, n_head_kv, 1);
-        v_cur_stage_[il] = ggml_new_tensor_3d(ctx_kv_, GGML_TYPE_F16, head_dim_, n_head_kv, 1);
+        k_cur_stage_[il] = ggml_new_tensor_3d(ctx_kv_, GGML_TYPE_F32, head_dim_, n_head_kv, 1);
+        v_cur_stage_[il] = ggml_new_tensor_3d(ctx_kv_, GGML_TYPE_F32, head_dim_, n_head_kv, 1);
     }
 
     kv_buf_ = ggml_backend_alloc_ctx_tensors(ctx_kv_, backend_);
