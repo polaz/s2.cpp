@@ -100,10 +100,10 @@ public:
     // Load model from GGUF. gpu_device=-1 means CPU only.
     bool load(const std::string & gguf_path, int32_t gpu_device = -1, int32_t backend_type = -1);
 
-    // Initialize KV cache for generation
+    // Initialize KV cache for generation; also builds persistent decode graphs.
     bool init_kv_cache(int32_t max_seq_len);
 
-    // Reset KV cache (for new generation)
+    // Reset KV cache position (for new generation without reallocating buffers)
     void reset();
 
     void clear_kv_cache();
@@ -112,7 +112,7 @@ public:
     bool prefill(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
                  int32_t n_threads, StepResult & result);
 
-    // Step: process a single timestep. flat_tokens: (num_codebooks+1)
+    // Step: process a single timestep using the persistent decode graph.
     bool step(const std::vector<int32_t> & flat_tokens, int32_t n_threads,
               StepResult & result);
 
@@ -131,7 +131,6 @@ private:
     ggml_backend_t backend_gpu_   = nullptr;
     ggml_backend_t backend_cpu_   = nullptr;
     ggml_gallocr_t allocr_        = nullptr;
-    ggml_gallocr_t fast_allocr_   = nullptr;
     ggml_context * ctx_kv_       = nullptr;
     ggml_backend_buffer_t kv_buf_ = nullptr;
     ggml_tensor *  memory_k_   = nullptr;
@@ -141,7 +140,6 @@ private:
     int32_t        n_gpu_layers_ = 0;
 
     // F16 copies of embedding tensors for CUDA get_rows compatibility
-    // (CUDA get_rows only supports F16/F32/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0)
     struct {
         ggml_context *       ctx = nullptr;
         ggml_backend_buffer_t buf = nullptr;
@@ -150,11 +148,60 @@ private:
         ggml_tensor *        fast_embeddings     = nullptr;
     } emb_f16_;
 
+    // ---------------------------------------------------------------------------
+    // Persistent decode graph for single-token step (rebuilt each init_kv_cache)
+    // kq_mask shape: (max_seq_len_+1, 1) — fixed for stable gallocr allocation.
+    // KV past reads the full layer slice; current K/V is appended via concat.
+    // k_write_views[il]->data is updated per step to point to the current n_past_
+    // slot in memory_k_/memory_v_.
+    // ---------------------------------------------------------------------------
+    struct DecodeState {
+        ggml_context *             ctx              = nullptr;
+        ggml_cgraph  *             graph            = nullptr;
+        // Input tensors (content updated per call via ggml_backend_tensor_set)
+        ggml_tensor *              semantic_ids     = nullptr;
+        ggml_tensor *              positions        = nullptr;
+        ggml_tensor *              semantic_mask    = nullptr;
+        ggml_tensor *              token_scale      = nullptr; // null if !scale_codebook_embeddings
+        std::vector<ggml_tensor *> cb_id_tensors;
+        ggml_tensor *              kq_mask          = nullptr; // shape: (max_seq_len_+1, 1)
+        // Per-layer KV write view tensors; ->data pointer updated per step
+        std::vector<ggml_tensor *> k_write_views;
+        std::vector<ggml_tensor *> v_write_views;
+        // Output tensors
+        ggml_tensor *              hidden_last      = nullptr;
+        ggml_tensor *              logits           = nullptr;
+    } decode_;
+
+    // ---------------------------------------------------------------------------
+    // Persistent fast decode graphs, one per n_tokens value (built lazily).
+    // fast_decode_states_[n_tokens-1] is built on first call for that n_tokens.
+    // These survive clear_kv_cache / init_kv_cache cycles (no KV cache dependency).
+    // ---------------------------------------------------------------------------
+    struct FastDecodeState {
+        ggml_context *  ctx        = nullptr;
+        ggml_cgraph  *  graph      = nullptr;
+        ggml_gallocr_t  allocr     = nullptr;
+        ggml_tensor  *  hidden0    = nullptr;
+        ggml_tensor  *  prefix_ids = nullptr; // null if n_tokens == 1
+        ggml_tensor  *  positions  = nullptr;
+        ggml_tensor  *  kq_mask    = nullptr;
+        ggml_tensor  *  logits     = nullptr;
+    };
+    std::vector<FastDecodeState> fast_decode_states_; // indexed [n_tokens-1]
+
     static bool backend_requires_single_token_semantic_prefill(ggml_backend_t gpu);
 
+    // Prefill / multi-token eval path (stateless: builds+frees graph each call)
     bool eval_cached(const std::vector<int32_t> & flat_tokens,
                      int32_t n_tokens, int32_t n_threads,
                      StepResult & result);
+
+    // Build the persistent single-token decode graph. Called from init_kv_cache.
+    bool build_decode_graph();
+
+    // Build a persistent fast decode graph for a given n_tokens. Called lazily.
+    bool build_fast_decode_graph(int32_t n_tokens, FastDecodeState & out);
 };
 
 } // namespace s2
