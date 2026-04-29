@@ -92,6 +92,7 @@ SlowARModel::~SlowARModel() {
         if (fds.allocr) ggml_gallocr_free(fds.allocr);
     }
 
+    if (ctx_copy_kv_)     ggml_free(ctx_copy_kv_);
     if (ctx_kv_)          ggml_free(ctx_kv_);
     if (kv_buf_)          ggml_backend_buffer_free(kv_buf_);
     if (weights_.ctx_w)   ggml_free(weights_.ctx_w);
@@ -545,6 +546,42 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
         return false;
     }
 
+    // Pre-allocate KV copy destination views (one per layer, data ptr updated per step).
+    // Avoids ggml_init + 2*n_layer ggml_view_3d + ggml_free on every step() call.
+    {
+        const size_t copy_ctx_size = 2ull * (size_t)n_layer * ggml_tensor_overhead() + 4096;
+        ggml_init_params pc = { copy_ctx_size, nullptr, /*no_alloc=*/true };
+        ctx_copy_kv_ = ggml_init(pc);
+        if (ctx_copy_kv_) {
+            k_copy_dst_.resize(n_layer);
+            v_copy_dst_.resize(n_layer);
+            for (int32_t il = 0; il < n_layer; ++il) {
+                const size_t layer_off_k = (size_t)il * memory_k_->nb[3];
+                k_copy_dst_[il] = ggml_view_3d(ctx_copy_kv_, memory_k_,
+                    head_dim_, n_head_kv, 1, memory_k_->nb[1], memory_k_->nb[2], layer_off_k);
+                k_copy_dst_[il]->buffer = memory_k_->buffer;
+
+                const size_t layer_off_v = (size_t)il * memory_v_->nb[3];
+                v_copy_dst_[il] = ggml_view_3d(ctx_copy_kv_, memory_v_,
+                    head_dim_, n_head_kv, 1, memory_v_->nb[1], memory_v_->nb[2], layer_off_v);
+                v_copy_dst_[il]->buffer = memory_v_->buffer;
+            }
+        }
+    }
+
+    // Initialize persistent kq_mask buffer: all -inf, [max_seq_len]=0.
+    kq_mask_buf_.assign((size_t)max_seq_len + 1, -std::numeric_limits<float>::infinity());
+    kq_mask_buf_[max_seq_len] = 0.0f;
+    if (decode_.kq_mask) {
+        ggml_backend_tensor_set(decode_.kq_mask, kq_mask_buf_.data(), 0,
+                                ((size_t)max_seq_len + 1) * sizeof(float));
+    }
+
+    // Pre-warm the decode graph on GPU so CUDA graph capture happens before generation.
+    if (backend_gpu_) {
+        warmup_decode_graph();
+    }
+
     return true;
 }
 
@@ -554,6 +591,13 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
 
 void SlowARModel::reset() {
     n_past_ = 0;
+    // Restore kq_mask to initial state (all -inf, [max_seq_len_]=0).
+    if (!kq_mask_buf_.empty() && decode_.kq_mask && max_seq_len_ > 0) {
+        std::fill(kq_mask_buf_.begin(), kq_mask_buf_.end(), -std::numeric_limits<float>::infinity());
+        kq_mask_buf_[max_seq_len_] = 0.0f;
+        ggml_backend_tensor_set(decode_.kq_mask, kq_mask_buf_.data(), 0,
+                                kq_mask_buf_.size() * sizeof(float));
+    }
 }
 
 void SlowARModel::clear_kv_cache() {
@@ -588,6 +632,14 @@ void SlowARModel::clear_kv_cache() {
     memory_v_ = nullptr;
     k_cur_stage_.clear();
     v_cur_stage_.clear();
+
+    if (ctx_copy_kv_) {
+        ggml_free(ctx_copy_kv_);
+        ctx_copy_kv_ = nullptr;
+    }
+    k_copy_dst_.clear();
+    v_copy_dst_.clear();
+    kq_mask_buf_.clear();
 
     max_seq_len_ = 0;
     n_past_ = 0;
@@ -765,6 +817,35 @@ bool SlowARModel::build_decode_graph() {
 }
 
 // ---------------------------------------------------------------------------
+// warmup_decode_graph()
+// Run 2 consecutive step() calls so GGML's CUDA graph mechanism captures
+// decode_.graph.  The snapshot saved before call-1 must match the state at
+// call-2 (no struct changes between calls) → warmup_complete=true → capture.
+// After warmup, n_past_ is reset to 0 and kq_mask is restored.
+// ---------------------------------------------------------------------------
+
+void SlowARModel::warmup_decode_graph() {
+    if (!decode_.ctx || !decode_.graph) return;
+
+    const int32_t codebook_dim = hparams_.num_codebooks + 1;
+    std::vector<int32_t> dummy(codebook_dim, 0);
+    dummy[0] = hparams_.semantic_begin_id;  // valid semantic token
+
+    StepResult dummy_result;
+    step(dummy, 1, dummy_result);  // call 1: snapshot saved, execute directly
+    step(dummy, 1, dummy_result);  // call 2: snapshot matches → CUDA graph captured
+
+    // Reset to pre-generation state.
+    n_past_ = 0;
+    if (!kq_mask_buf_.empty() && decode_.kq_mask) {
+        std::fill(kq_mask_buf_.begin(), kq_mask_buf_.end(), -std::numeric_limits<float>::infinity());
+        kq_mask_buf_[max_seq_len_] = 0.0f;
+        ggml_backend_tensor_set(decode_.kq_mask, kq_mask_buf_.data(), 0,
+                                kq_mask_buf_.size() * sizeof(float));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // prefill() / step()
 // ---------------------------------------------------------------------------
 
@@ -804,13 +885,14 @@ bool SlowARModel::step(const std::vector<int32_t> & flat_tokens, int32_t n_threa
                                semantic <= hparams_.semantic_end_id);
     const float sem_scale  = 1.0f / std::sqrt(static_cast<float>(codebook_dim));
 
-    // Fill kq_mask: [0..n_past_-1]=0 (valid past), [n_past_..max_seq_len_-1]=-inf,
-    // [max_seq_len_]=0 (current token appended last via concat).
-    const int32_t mask_len = max_seq_len_ + 1;
-    std::vector<float> kq_data(mask_len, -std::numeric_limits<float>::infinity());
-    for (int32_t i = 0; i < n_past_; ++i) kq_data[i] = 0.0f;
-    kq_data[max_seq_len_] = 0.0f;
-    ggml_backend_tensor_set(decode_.kq_mask, kq_data.data(), 0, (size_t)mask_len * sizeof(float));
+    // Update kq_mask incrementally: only the new valid slot needs to change from -inf to 0.
+    // kq_mask_buf_ is pre-initialized to all -inf with [max_seq_len_]=0; each step
+    // unlocks exactly one more past position (position n_past_-1 from the PREVIOUS step).
+    if (n_past_ > 0 && !kq_mask_buf_.empty()) {
+        kq_mask_buf_[n_past_ - 1] = 0.0f;
+        const float zero = 0.0f;
+        ggml_backend_tensor_set(decode_.kq_mask, &zero, (size_t)(n_past_ - 1) * sizeof(float), sizeof(float));
+    }
 
     // Input ids and position
     int32_t pos = n_past_;
@@ -838,55 +920,29 @@ bool SlowARModel::step(const std::vector<int32_t> & flat_tokens, int32_t n_threa
         return false;
     }
 
-    // Post-graph: async D2D copy staging → correct KV slot for this step.
-    // Copies are issued on the compute stream (no per-copy sync); the next
-    // graph_compute on the same stream will see the updated KV cache.
-    if (backend_gpu_) {
-        const size_t kv_copy_ctx_size = 2ull * (size_t)hparams_.block_count * ggml_tensor_overhead() + 4096;
-        ggml_init_params pc = { kv_copy_ctx_size, nullptr, /*no_alloc=*/true };
-        ggml_context * ctx_copy = ggml_init(pc);
-        if (ctx_copy) {
-            for (int32_t il = 0; il < hparams_.block_count; ++il) {
-                const size_t layer_off_k = (size_t)il * memory_k_->nb[3];
-                const size_t slot_off_k  = (size_t)n_past_ * memory_k_->nb[2];
-                ggml_tensor * k_dst = ggml_view_3d(ctx_copy, memory_k_,
-                    head_dim_, hparams_.head_count_kv, 1,
-                    memory_k_->nb[1], memory_k_->nb[2], layer_off_k + slot_off_k);
-                k_dst->buffer = memory_k_->buffer;
-                ggml_backend_tensor_copy_async(backend_gpu_, backend_gpu_, k_cur_stage_[il], k_dst);
+    // Post-graph: copy staging K/V → correct KV slot for this step.
+    // Uses pre-allocated view tensors; only the data pointer is updated each step
+    // to avoid ggml_init + 2*n_layer ggml_view_3d + ggml_free per step.
+    if (!k_copy_dst_.empty()) {
+        for (int32_t il = 0; il < hparams_.block_count; ++il) {
+            const size_t layer_off_k = (size_t)il * memory_k_->nb[3];
+            const size_t slot_off_k  = (size_t)n_past_ * memory_k_->nb[2];
+            k_copy_dst_[il]->data = (char *)memory_k_->data + layer_off_k + slot_off_k;
 
-                const size_t layer_off_v = (size_t)il * memory_v_->nb[3];
-                const size_t slot_off_v  = (size_t)n_past_ * memory_v_->nb[2];
-                ggml_tensor * v_dst = ggml_view_3d(ctx_copy, memory_v_,
-                    head_dim_, hparams_.head_count_kv, 1,
-                    memory_v_->nb[1], memory_v_->nb[2], layer_off_v + slot_off_v);
-                v_dst->buffer = memory_v_->buffer;
-                ggml_backend_tensor_copy_async(backend_gpu_, backend_gpu_, v_cur_stage_[il], v_dst);
-            }
-            ggml_free(ctx_copy);
+            const size_t layer_off_v = (size_t)il * memory_v_->nb[3];
+            const size_t slot_off_v  = (size_t)n_past_ * memory_v_->nb[2];
+            v_copy_dst_[il]->data = (char *)memory_v_->data + layer_off_v + slot_off_v;
         }
-    } else {
-        // CPU: blocking copy (tiny tensors, negligible cost)
-        const size_t kv_copy_ctx_size = 2ull * (size_t)hparams_.block_count * ggml_tensor_overhead() + 4096;
-        ggml_init_params pc = { kv_copy_ctx_size, nullptr, /*no_alloc=*/true };
-        ggml_context * ctx_copy = ggml_init(pc);
-        if (ctx_copy) {
+        if (backend_gpu_) {
             for (int32_t il = 0; il < hparams_.block_count; ++il) {
-                const size_t layer_off_k = (size_t)il * memory_k_->nb[3];
-                const size_t slot_off_k  = (size_t)n_past_ * memory_k_->nb[2];
-                ggml_tensor * k_dst = ggml_view_3d(ctx_copy, memory_k_,
-                    head_dim_, hparams_.head_count_kv, 1,
-                    memory_k_->nb[1], memory_k_->nb[2], layer_off_k + slot_off_k);
-                ggml_backend_tensor_copy(k_cur_stage_[il], k_dst);
-
-                const size_t layer_off_v = (size_t)il * memory_v_->nb[3];
-                const size_t slot_off_v  = (size_t)n_past_ * memory_v_->nb[2];
-                ggml_tensor * v_dst = ggml_view_3d(ctx_copy, memory_v_,
-                    head_dim_, hparams_.head_count_kv, 1,
-                    memory_v_->nb[1], memory_v_->nb[2], layer_off_v + slot_off_v);
-                ggml_backend_tensor_copy(v_cur_stage_[il], v_dst);
+                ggml_backend_tensor_copy_async(backend_gpu_, backend_gpu_, k_cur_stage_[il], k_copy_dst_[il]);
+                ggml_backend_tensor_copy_async(backend_gpu_, backend_gpu_, v_cur_stage_[il], v_copy_dst_[il]);
             }
-            ggml_free(ctx_copy);
+        } else {
+            for (int32_t il = 0; il < hparams_.block_count; ++il) {
+                ggml_backend_tensor_copy(k_cur_stage_[il], k_copy_dst_[il]);
+                ggml_backend_tensor_copy(v_cur_stage_[il], v_copy_dst_[il]);
+            }
         }
     }
 

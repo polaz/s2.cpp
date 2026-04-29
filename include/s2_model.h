@@ -154,6 +154,16 @@ private:
     std::vector<ggml_tensor *> k_cur_stage_;
     std::vector<ggml_tensor *> v_cur_stage_;
 
+    // Pre-allocated KV copy destination views (avoid ggml_init/free per step).
+    // data ptr updated each step to point to the correct n_past_ KV slot.
+    ggml_context *             ctx_copy_kv_  = nullptr;
+    std::vector<ggml_tensor *> k_copy_dst_;   // view into memory_k_, data updated per step
+    std::vector<ggml_tensor *> v_copy_dst_;   // view into memory_v_, data updated per step
+
+    // Persistent kq_mask buffer — avoids per-step malloc and enables incremental updates.
+    // kq_mask_buf_[0..n_past_-1]=0, [n_past_..max-1]=-inf, [max_seq_len_]=0.
+    std::vector<float> kq_mask_buf_;
+
     // F16 copies of embedding tensors for CUDA get_rows compatibility
     struct {
         ggml_context *       ctx = nullptr;
@@ -214,6 +224,10 @@ private:
 
     // Build the persistent single-token decode graph. Called from init_kv_cache.
     bool build_decode_graph();
+
+    // Run 2 dummy step() calls to trigger CUDA graph capture for decode_.graph.
+    // Resets n_past_=0 and restores kq_mask after warmup.
+    void warmup_decode_graph();
 
     // Build a persistent fast decode graph for a given n_tokens. Called lazily.
     bool build_fast_decode_graph(int32_t n_tokens, FastDecodeState & out);
