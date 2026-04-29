@@ -8,6 +8,14 @@
 #include <string>
 #include <algorithm>
 #include <stdexcept>
+#include <chrono>
+
+namespace {
+    using hrc = std::chrono::high_resolution_clock;
+    static double elapsed_ms(hrc::time_point t0) {
+        return std::chrono::duration<double, std::milli>(hrc::now() - t0).count();
+    }
+} // namespace
 #ifdef __linux__
 #  include <fcntl.h>
 #  include <unistd.h>
@@ -841,10 +849,13 @@ void SlowARModel::warmup_decode_graph() {
     constexpr int WARMUP_MAX_CALLS = 4;
     StepResult dummy_result;
     std::cerr << "[Model] Warming up decode graph (" << WARMUP_MAX_CALLS << " calls)..." << std::endl;
+    auto t_wu = hrc::now();
     for (int i = 0; i < WARMUP_MAX_CALLS; ++i) {
+        auto t_i = hrc::now();
         if (!step(dummy, 1, dummy_result)) break;
+        std::fprintf(stderr, "[Model] Warmup call %d: %.0f ms\n", i + 1, elapsed_ms(t_i));
     }
-    std::cerr << "[Model] Decode graph warmup done (CUDA graph capture logged above if successful)." << std::endl;
+    std::fprintf(stderr, "[Model] Decode graph warmup done: %.0f ms total\n", elapsed_ms(t_wu));
 
     // Reset to pre-generation state.
     n_past_ = 0;
