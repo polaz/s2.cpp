@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <chrono>
 
 namespace s2 {
 
@@ -1060,12 +1061,15 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, 131072, false);
         ggml_build_forward_expand(gf, latent);
 
+        auto t_qalloc = std::chrono::high_resolution_clock::now();
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
         if (!allocr || !ggml_gallocr_alloc_graph(allocr, gf)) {
             if (allocr) ggml_gallocr_free(allocr);
             ggml_free(ctx);
             return false;
         }
+        std::fprintf(stderr, "[Timing] Codec decode step2 alloc: %.1f ms\n",
+            std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-t_qalloc).count());
 
         ggml_backend_tensor_set(stage_in, stage.data(), 0, stage.size() * sizeof(float));
         if (inp.positions) {
@@ -1078,12 +1082,15 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
         }
 
         if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, n_threads);
+        auto t_qcomp = std::chrono::high_resolution_clock::now();
         if (ggml_backend_graph_compute(impl_->backend, gf) != GGML_STATUS_SUCCESS) {
             std::cerr << "[Codec::decode] quantizer decode compute failed." << std::endl;
             ggml_gallocr_free(allocr);
             ggml_free(ctx);
             return false;
         }
+        std::fprintf(stderr, "[Timing] Codec decode step2 compute: %.1f ms\n",
+            std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-t_qcomp).count());
 
         latent_frames = static_cast<int32_t>(latent->ne[1]);
         latent_out.resize(static_cast<size_t>(latent->ne[0]) * latent_frames);
@@ -1114,21 +1121,27 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, 131072, false);
         ggml_build_forward_expand(gf, audio_t);
 
+        auto t_dalloc = std::chrono::high_resolution_clock::now();
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
         if (!allocr || !ggml_gallocr_alloc_graph(allocr, gf)) {
             if (allocr) ggml_gallocr_free(allocr);
             ggml_free(ctx);
             return false;
         }
+        std::fprintf(stderr, "[Timing] Codec decode step3 alloc: %.1f ms\n",
+            std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-t_dalloc).count());
 
         ggml_backend_tensor_set(latent_in, latent_out.data(), 0, latent_out.size() * sizeof(float));
         if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, n_threads);
+        auto t_dcomp = std::chrono::high_resolution_clock::now();
         if (ggml_backend_graph_compute(impl_->backend, gf) != GGML_STATUS_SUCCESS) {
             std::cerr << "[Codec::decode] decoder compute failed." << std::endl;
             ggml_gallocr_free(allocr);
             ggml_free(ctx);
             return false;
         }
+        std::fprintf(stderr, "[Timing] Codec decode step3 compute: %.1f ms\n",
+            std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-t_dcomp).count());
 
         // audio_t is (1, T) or (C, T) — we expect (1, T), take total elements
         const int32_t n_samples = static_cast<int32_t>(ggml_nelements(audio_t));
