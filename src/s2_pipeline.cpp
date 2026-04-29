@@ -31,9 +31,10 @@ bool Pipeline::init(const PipelineParams & params) {
         return false;
     }
 
-    // Codec uses GPU for encode + decode step2 (transformer), CPU for decode step3
-    // (conv_transpose_1d): CUDA kernel is 4x slower than CPU for that op.
-    if (!codec_.load(params.model_path, params.gpu_device, params.backend_type)) {
+    // Codec runs on CPU: CUDA conv_transpose_1d (decode step3) is 4x slower than
+    // multithreaded CPU. Model weights live in CPU buffer so all codec ops are CPU.
+    // TODO: implement im2col-based CUDA conv_transpose_1d to enable full GPU codec.
+    if (!codec_.load(params.model_path, -1, -1)) {
         safe_print_error_ln("Pipeline error: could not load codec from " + params.model_path);
         return false;
     }

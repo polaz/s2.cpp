@@ -692,18 +692,7 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t gpu_device, int32_t
     }
     if (!impl_->backend) impl_->backend = ggml_backend_cpu_init();
     if (!impl_->backend) { std::cerr << "[Codec] No backend." << std::endl; return false; }
-
-    // Always keep a CPU backend for conv_transpose (decode step3): CUDA kernel is
-    // 4x slower than multithreaded CPU for this op (scatter vs BLAS).
-    if (ggml_backend_is_cpu(impl_->backend)) {
-        impl_->backend_cpu = impl_->backend; // primary IS cpu, reuse
-    } else {
-        impl_->backend_cpu = ggml_backend_cpu_init();
-        if (!impl_->backend_cpu) {
-            std::cerr << "[Codec] CPU backend init failed, using primary for decode." << std::endl;
-            impl_->backend_cpu = impl_->backend;
-        }
-    }
+    impl_->backend_cpu = impl_->backend;
 
     struct gguf_init_params params = { true, &impl_->ctx_w };
     gguf_context * gguf_ctx = gguf_init_from_file(gguf_path.c_str(), params);
