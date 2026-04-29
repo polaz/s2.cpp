@@ -30,7 +30,9 @@ bool Pipeline::init(const PipelineParams & params) {
         return false;
     }
 
-    if (!codec_.load(params.model_path, params.gpu_device, params.backend_type)) {
+    // Codec (VQ-VAE with Conv1d layers) runs on CPU: ggml CUDA IM2COL does not
+    // support the codec's convolution tensor shapes. S2 model uses GPU independently.
+    if (!codec_.load(params.model_path, -1, -1)) {
         safe_print_error_ln("Pipeline error: could not load codec from " + params.model_path);
         return false;
     }
