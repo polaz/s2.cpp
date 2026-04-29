@@ -24,6 +24,14 @@ if(S2_VULKAN)
 endif()
 if(S2_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
+    # Enable ggml's CUDA Graphs path. Profiling on A100 showed the
+    # autoregressive decode loop (eval_cached + fast_decode×N codebooks
+    # per step) was bottlenecked on per-token CUDA launch / sync
+    # overhead — sm utilisation hovered near zero between bursts.
+    # ggml's automatic capture-replay (warmup-then-replay) eliminates
+    # the per-call CPU code path on subsequent identical-shape graph
+    # computes, which is exactly the fast_decode loop's pattern.
+    set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
 endif()
 if(S2_METAL)
     set(GGML_METAL ON CACHE BOOL "" FORCE)
