@@ -55,6 +55,14 @@ bool Pipeline::init(const PipelineParams & params) {
         }
     }
 
+    // Pre-allocate KV cache and warm up CUDA graphs once at startup.
+    // synthesize_raw() will reset() between calls or reallocate if max_seq_len grows.
+    const int32_t prealloc_seq_len = params.prealloc_kv_len > 0
+        ? params.prealloc_kv_len : 2048;
+    if (!model_.init_kv_cache(prealloc_seq_len)) {
+        safe_print_error_ln("Pipeline warning: KV cache pre-allocation failed; will allocate per request.");
+    }
+
     initialized_ = true;
     return true;
 }
@@ -151,8 +159,6 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
         return false;
     }
 
-    model_.clear_kv_cache();
-
     safe_print_ln("--- Pipeline Synthesize ---");
     safe_print_ln("Text: " + params.text);
 
@@ -176,9 +182,16 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
         num_codebooks, T_prompt);
 
     int32_t max_seq_len = prompt.cols + params.gen.max_new_tokens;
-    if (!model_.init_kv_cache(max_seq_len)) {
-        safe_print_error_ln("Pipeline error: init_kv_cache failed.");
-        return false;
+    if (max_seq_len > model_.max_seq_len()) {
+        // Request exceeds pre-allocated KV capacity — reallocate (pays warmup cost once).
+        model_.clear_kv_cache();
+        if (!model_.init_kv_cache(max_seq_len)) {
+            safe_print_error_ln("Pipeline error: init_kv_cache failed.");
+            return false;
+        }
+    } else {
+        // Fast path: reuse existing KV buffers and CUDA graphs.
+        model_.reset();
     }
 
     GenerateResult res = generate(model_, tokenizer_.config(), prompt, params.gen);
@@ -193,7 +206,6 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
         return false;
     }
 
-    model_.clear_kv_cache();
     return true;
 }
 

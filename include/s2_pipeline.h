@@ -20,8 +20,9 @@ struct PipelineParams {
     std::string prompt_audio_path;
     std::string output_path;
     GenerateParams gen;
-    int32_t gpu_device = -1;   // -1 = CPU only
-    int32_t backend_type = -1; //0 = Vulkan; 1 = Cuda; 2 = Metal;
+    int32_t gpu_device = -1;        // -1 = CPU only
+    int32_t backend_type = -1;     // 0 = Vulkan; 1 = Cuda; 2 = Metal;
+    int32_t prealloc_kv_len = 2048; // KV cache pre-allocated at init; 0 = use default
     bool trim_silence = false;
     bool normalize_output = false;
     bool normalize_dynamic = false;

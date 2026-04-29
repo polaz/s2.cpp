@@ -123,6 +123,7 @@ public:
                      std::vector<float> & logits_out);
 
     const ModelHParams & hparams() const { return hparams_; }
+    int32_t max_seq_len() const { return max_seq_len_; }
 
     // Restrict logits readback to [begin, end) — positions outside are returned as -inf.
     // Call before generation to reduce PCIe transfer from vocab_size to semantic range only.
